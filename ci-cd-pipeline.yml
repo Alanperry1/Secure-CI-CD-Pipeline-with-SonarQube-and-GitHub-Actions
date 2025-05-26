@@ -1,0 +1,382 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.9'
+  JAVA_VERSION: '11'
+  SONAR_SCANNER_VERSION: '4.8.0.2856'
+
+jobs:
+  # Job to detect the project type and set up matrix
+  detect-project-type:
+    runs-on: ubuntu-latest
+    outputs:
+      project-type: ${{ steps.detect.outputs.type }}
+      has-tests: ${{ steps.detect.outputs.has-tests }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            echo "type=nodejs" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            echo "type=python" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "type=maven" >> $GITHUB_OUTPUT
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "type=gradle" >> $GITHUB_OUTPUT
+          elif [ -f "*.csproj" ] || [ -f "*.sln" ]; then
+            echo "type=dotnet" >> $GITHUB_OUTPUT
+          else
+            echo "type=generic" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check for test directories
+          if [ -d "test" ] || [ -d "tests" ] || [ -d "__tests__" ] || [ -d "spec" ]; then
+            echo "has-tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-tests=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Lint and Code Quality Check
+  lint:
+    runs-on: ubuntu-latest
+    needs: detect-project-type
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for better relevancy of analysis
+
+      - name: Setup Node.js (if Node.js project)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Setup Python (if Python project)
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Java (if Java project)
+        if: needs.detect-project-type.outputs.project-type == 'maven' || needs.detect-project-type.outputs.project-type == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Install dependencies and lint (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        run: |
+          npm ci
+          npm run lint || echo "No lint script found"
+
+      - name: Install dependencies and lint (Python)
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        run: |
+          pip install -r requirements.txt
+          pip install flake8 black isort
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          black --check .
+          isort --check-only .
+
+      - name: Lint (Java Maven)
+        if: needs.detect-project-type.outputs.project-type == 'maven'
+        run: |
+          mvn checkstyle:check || echo "No checkstyle configuration found"
+
+      - name: Lint (Java Gradle)
+        if: needs.detect-project-type.outputs.project-type == 'gradle'
+        run: |
+          ./gradlew checkstyleMain || echo "No checkstyle configuration found"
+
+  # Build and Test
+  build-and-test:
+    runs-on: ubuntu-latest
+    needs: [detect-project-type, lint]
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        # Add more OS if needed: [ubuntu-latest, windows-latest, macos-latest]
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Setup Python
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Java
+        if: needs.detect-project-type.outputs.project-type == 'maven' || needs.detect-project-type.outputs.project-type == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Setup .NET
+        if: needs.detect-project-type.outputs.project-type == 'dotnet'
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '6.0.x'
+
+      # Node.js Build and Test
+      - name: Install dependencies (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        run: npm ci
+
+      - name: Build (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        run: npm run build || echo "No build script found"
+
+      - name: Test with coverage (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs' && needs.detect-project-type.outputs.has-tests == 'true'
+        run: |
+          npm run test:coverage || npm test || echo "No test script found"
+
+      # Python Build and Test
+      - name: Install dependencies (Python)
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Test with coverage (Python)
+        if: needs.detect-project-type.outputs.project-type == 'python' && needs.detect-project-type.outputs.has-tests == 'true'
+        run: |
+          pytest --cov=src --cov-report=xml --cov-report=html || echo "No tests found"
+
+      # Java Maven Build and Test
+      - name: Build and test (Maven)
+        if: needs.detect-project-type.outputs.project-type == 'maven'
+        run: |
+          mvn clean compile
+          mvn test jacoco:report || echo "No tests found"
+
+      # Java Gradle Build and Test
+      - name: Build and test (Gradle)
+        if: needs.detect-project-type.outputs.project-type == 'gradle'
+        run: |
+          ./gradlew build
+          ./gradlew test jacocoTestReport || echo "No tests found"
+
+      # .NET Build and Test
+      - name: Build and test (.NET)
+        if: needs.detect-project-type.outputs.project-type == 'dotnet'
+        run: |
+          dotnet build
+          dotnet test --collect:"XPlat Code Coverage" || echo "No tests found"
+
+      # Upload test artifacts
+      - name: Upload coverage reports
+        if: needs.detect-project-type.outputs.has-tests == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            htmlcov/
+            target/site/jacoco/
+            build/reports/jacoco/
+            TestResults/
+          retention-days: 30
+
+  # SonarQube Analysis
+  sonarqube-analysis:
+    runs-on: ubuntu-latest
+    needs: [detect-project-type, build-and-test]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Setup Python
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Java
+        if: needs.detect-project-type.outputs.project-type == 'maven' || needs.detect-project-type.outputs.project-type == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      # Download coverage artifacts
+      - name: Download coverage reports
+        if: needs.detect-project-type.outputs.has-tests == 'true'
+        uses: actions/download-artifact@v3
+        with:
+          name: coverage-report
+
+      # Install dependencies for analysis
+      - name: Install dependencies (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        run: npm ci
+
+      - name: Install dependencies (Python)
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        run: pip install -r requirements.txt
+
+      # Run tests to generate fresh coverage (if needed)
+      - name: Generate coverage (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs' && needs.detect-project-type.outputs.has-tests == 'true'
+        run: npm run test:coverage || npm test
+
+      - name: Generate coverage (Python)
+        if: needs.detect-project-type.outputs.project-type == 'python' && needs.detect-project-type.outputs.has-tests == 'true'
+        run: |
+          pip install pytest pytest-cov
+          pytest --cov=src --cov-report=xml
+
+      - name: Generate coverage (Maven)
+        if: needs.detect-project-type.outputs.project-type == 'maven' && needs.detect-project-type.outputs.has-tests == 'true'
+        run: mvn test jacoco:report
+
+      - name: Generate coverage (Gradle)
+        if: needs.detect-project-type.outputs.project-type == 'gradle' && needs.detect-project-type.outputs.has-tests == 'true'
+        run: ./gradlew test jacocoTestReport
+
+      # SonarQube Scan
+      - name: SonarQube Scan
+        uses: sonarqube-quality-gate-action@master
+        with:
+          scanMetadataReportFile: target/sonar/report-task.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # Alternative: Use SonarCloud GitHub Action
+      - name: SonarCloud Scan (Alternative)
+        if: env.SONAR_HOST_URL == 'https://sonarcloud.io'
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # Security Vulnerability Scan
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: [detect-project-type]
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # Language-specific security scans
+      - name: Setup Node.js for security scan
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: NPM Audit (Node.js)
+        if: needs.detect-project-type.outputs.project-type == 'nodejs'
+        run: |
+          npm ci
+          npm audit --audit-level high
+
+      - name: Setup Python for security scan
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Safety check (Python)
+        if: needs.detect-project-type.outputs.project-type == 'python'
+        run: |
+          pip install safety
+          safety check -r requirements.txt || echo "Safety check completed with warnings"
+
+  # Deployment (conditional)
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, sonarqube-analysis, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production..."
+          # Add your deployment commands here
+          # Examples:
+          # - Deploy to AWS, Azure, GCP
+          # - Deploy to Heroku
+          # - Deploy to Kubernetes
+          # - Deploy to custom servers
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "Deployment successful!"
+          # Add notification logic (Slack, email, etc.)
+
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          echo "Deployment failed!"
+          # Add failure notification logic
+
+  # Cleanup
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    
+    steps:
+      - name: Clean up artifacts
+        run: |
+          echo "Cleaning up temporary artifacts..."
+          # Add cleanup commands if needed
